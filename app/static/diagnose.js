@@ -9,6 +9,15 @@ let records = [];
 let selectedId = null;
 let numPoints = MIN_POINTS;
 
+/* 异步裁决状态：
+ * - metaSeq：详情请求序号，仅最新一次详情回包可更新电压上限；
+ * - diagSeq：诊断请求序号，仅最新一次诊断回包可更新结论/错误；
+ * - displayedKey：当前页面所显示结论/错误对应的提交签名（记录 +
+ *   实际提交的测点与容差），输入一旦偏离该签名，旧结论与旧错误立即撤下。 */
+let metaSeq = 0;
+let diagSeq = 0;
+let displayedKey = null;
+
 const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
@@ -21,6 +30,13 @@ function showError(msg) {
   errBox.hidden = false;
 }
 function clearError() { errBox.hidden = true; }
+
+/* 本地校验/批量导入错误：与当前输入绑定，输入一改即被撤下。 */
+function showLocalError(msg) {
+  $("#diagResultCard").hidden = true;
+  displayedKey = currentInputKey();
+  showError(msg);
+}
 
 /* ---------------- 记录选择 ---------------- */
 
@@ -54,11 +70,25 @@ async function loadRecords(prefillId) {
 }
 
 async function fetchRecordMeta(id) {
+  const seq = ++metaSeq;
   selectedId = Number(id);
+  // 记录一切换，旧结论、旧错误与旧电压上限立即失效
   $("#diagResultCard").hidden = true;
-  const res = await fetch(`/api/trials/${id}`);
-  if (!res.ok) { $("#recordMeta").textContent = "记录不存在"; return; }
-  const rec = await res.json();
+  clearError();
+  displayedKey = null;
+  $("#recordMeta").textContent = "";
+  const isCurrent = () => seq === metaSeq && selectedId === Number(id);
+  let rec;
+  try {
+    const res = await fetch(`/api/trials/${id}`);
+    if (!isCurrent()) return;  // 迟到回包：所属记录已非当前选中，丢弃
+    if (!res.ok) { $("#recordMeta").textContent = "记录不存在"; return; }
+    rec = await res.json();
+  } catch (e) {
+    if (isCurrent()) $("#recordMeta").textContent = "记录详情加载失败：" + e.message;
+    return;
+  }
+  if (!isCurrent()) return;  // 解析期间又切换了记录，丢弃
   const voc = rec.result?.baseline?.voc;
   $("#recordMeta").textContent = voc !== undefined
     ? `基线开路电压（电压上限）：${fmt(voc, 3)} V`
@@ -89,6 +119,27 @@ function collectPointsRaw() {
     v: tr.querySelector(".p-v").value.trim(),
     i: tr.querySelector(".p-i").value.trim(),
   }));
+}
+
+/* 当前提交签名：选中的记录 + 容差原文 + 实际会被提交的测点原文
+ * （批量框非空时以批量框为准，否则以表格为准，与 gatherBody 的取源一致）。 */
+function currentInputKey() {
+  const bulk = $("#bulkPoints").value;
+  return JSON.stringify({
+    id: selectedId,
+    tol: $("#tolerance").value,
+    src: bulk.trim() !== "" ? bulk : collectPointsRaw(),
+  });
+}
+
+/* 输入变化后调用：当前输入一旦偏离已显示结论/错误所属的提交，
+ * 立即撤下旧结论与旧错误（在途回包由提交时捕获的签名另行裁决丢弃）。 */
+function dropStaleOutcome() {
+  if (displayedKey !== null && displayedKey !== currentInputKey()) {
+    $("#diagResultCard").hidden = true;
+    clearError();
+    displayedKey = null;
+  }
 }
 
 /* 批量文本：每行一个测点，支持 "V, I"（逗号/空格/Tab/分号分隔）或 JSON 对象。
@@ -124,10 +175,10 @@ function importBulkPoints() {
   const text = $("#bulkPoints").value;
   let parsed;
   try { parsed = parseBulkPoints(text); }
-  catch (e) { showError(e.message); return; }
+  catch (e) { showLocalError(e.message); return; }
   clearError();
   if (parsed.length < MIN_POINTS) {
-    showError(`批量测点至少需要 ${MIN_POINTS} 个，当前仅 ${parsed.length} 个`);
+    showLocalError(`批量测点至少需要 ${MIN_POINTS} 个，当前仅 ${parsed.length} 个`);
     return;
   }
   numPoints = parsed.length;
@@ -161,25 +212,49 @@ function gatherBody() {
 
 async function submitDiagnosis() {
   clearError();
-  if (!selectedId) { showError("请先选择一条试算记录"); return; }
+  if (!selectedId) { showLocalError("请先选择一条试算记录"); return; }
   let body;
   try { body = gatherBody(); }
-  catch (e) { showError(e.message); return; }
+  catch (e) { showLocalError(e.message); return; }
+
+  // 捕获发起时的记录、实际提交的测点与容差（签名）及请求序号；
+  // 回包时三者共同裁决：只有仍对应当前输入的最新请求可更新页面。
+  const reqId = selectedId;
+  const reqKey = currentInputKey();
+  const seq = ++diagSeq;
+  const isCurrent = () =>
+    seq === diagSeq && selectedId === reqId && currentInputKey() === reqKey;
 
   let res, data;
   try {
-    res = await fetch(`/api/trials/${selectedId}/diagnose`, {
+    res = await fetch(`/api/trials/${reqId}/diagnose`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
     data = await res.json();
   } catch (e) {
-    showError("网络/服务错误：" + e.message);
+    // 有效（仍属当前输入的最新）请求失败：显示错误；失效回包静默丢弃
+    if (isCurrent()) {
+      $("#diagResultCard").hidden = true;
+      displayedKey = reqKey;
+      showError("网络/服务错误：" + e.message);
+    }
     return;
   }
-  if (res.status === 404) { showError("试算记录不存在"); return; }
-  if (!res.ok) { showError(data.detail || "诊断失败"); return; }
+  if (!isCurrent()) return;  // 迟到/失效回包：记录已切换或输入已改，丢弃
+  displayedKey = reqKey;
+  if (res.status === 404) {
+    $("#diagResultCard").hidden = true;
+    showError("试算记录不存在");
+    return;
+  }
+  if (!res.ok) {
+    $("#diagResultCard").hidden = true;
+    showError(data.detail || "诊断失败");
+    return;
+  }
+  clearError();
   renderDiagnosis(data.diagnosis);
 }
 
@@ -244,13 +319,21 @@ function renderDiagnosis(d) {
 /* ---------------- 事件与初始化 ---------------- */
 
 $("#recordSelect").addEventListener("change", (e) => fetchRecordMeta(e.target.value));
-$("#addPointBtn").addEventListener("click", () => { numPoints++; renderPointRows(); });
+$("#addPointBtn").addEventListener("click", () => {
+  numPoints++; renderPointRows(); dropStaleOutcome();
+});
 $("#removePointBtn").addEventListener("click", () => {
   if (numPoints <= MIN_POINTS) return;
-  numPoints--; renderPointRows();
+  numPoints--; renderPointRows(); dropStaleOutcome();
 });
 $("#diagnoseBtn").addEventListener("click", submitDiagnosis);
 $("#bulkLoadBtn").addEventListener("click", importBulkPoints);
+
+// 当前提交源（容差 / 批量框 / 表格测点）的任何编辑，
+// 立即使旧结论与旧错误失效（批量框非空时表格编辑不影响提交源，不会误清）
+$("#tolerance").addEventListener("input", dropStaleOutcome);
+$("#bulkPoints").addEventListener("input", dropStaleOutcome);
+$("#pointsTable").addEventListener("input", dropStaleOutcome);
 
 renderPointRows();
 const prefill = new URLSearchParams(location.search).get("id");
