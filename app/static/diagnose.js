@@ -8,6 +8,10 @@ const errBox = $("#diagError");
 let records = [];
 let selectedId = null;
 let numPoints = MIN_POINTS;
+// 请求纪元（单调递增）：切换记录/改动输入/发起新请求即作废旧纪元的在途回包。
+// metaEpoch 裁决详情回包，diagEpoch 裁决诊断回包，互不影响。
+let metaEpoch = 0;
+let diagEpoch = 0;
 
 const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -53,12 +57,27 @@ async function loadRecords(prefillId) {
   fetchRecordMeta(selectedId);
 }
 
+/* 旧诊断结果/错误立即作废：切换记录或当前提交源（容差、当前生效测点）
+ * 一旦变化，页面上不得残留与当前输入不符的结论与错误。 */
+function invalidateDiagnosis() {
+  diagEpoch++;
+  clearError();
+  $("#diagResultCard").hidden = true;
+}
+
 async function fetchRecordMeta(id) {
   selectedId = Number(id);
-  $("#diagResultCard").hidden = true;
+  invalidateDiagnosis();
+  // 切换记录即作废旧详情请求与旧电压上限，仅本纪元、仍选中的回包可回填
+  const epoch = ++metaEpoch;
+  $("#recordMeta").textContent = "加载中…";
   const res = await fetch(`/api/trials/${id}`);
+  if (epoch !== metaEpoch || selectedId !== Number(id)) return;
   if (!res.ok) { $("#recordMeta").textContent = "记录不存在"; return; }
   const rec = await res.json();
+  if (epoch !== metaEpoch || selectedId !== Number(id)) return;
+  // 再核对回包所属记录：A 的迟到详情不得覆盖 B 的电压上限
+  if (Number(rec.id) !== Number(id)) return;
   const voc = rec.result?.baseline?.voc;
   $("#recordMeta").textContent = voc !== undefined
     ? `基线开路电压（电压上限）：${fmt(voc, 3)} V`
@@ -159,27 +178,53 @@ function gatherBody() {
 
 /* ---------------- 提交与渲染 ---------------- */
 
+/* 当前提交源的指纹：容差 + 实际提交的测点（批量框非空取批量，否则取表格）。
+ * 回包只在与当前输入一致时才允许落表，慢请求、旧输入一律丢弃。 */
+function currentInputSignature(body) {
+  if (body) return JSON.stringify({ tolerance: body.tolerance, points: body.points });
+  try {
+    const g = gatherBody();
+    return JSON.stringify({ tolerance: g.tolerance, points: g.points });
+  } catch (e) { return null; }
+}
+
 async function submitDiagnosis() {
   clearError();
   if (!selectedId) { showError("请先选择一条试算记录"); return; }
   let body;
   try { body = gatherBody(); }
-  catch (e) { showError(e.message); return; }
+  catch (e) {
+    // 输入已不能按旧请求解释：旧结论/错误作废，且在途回包不得再落页面
+    invalidateDiagnosis();
+    showError(e.message);
+    return;
+  }
+
+  // 新请求成为唯一有效请求：同记录连发时，旧测点的慢响应由纪元裁决丢弃
+  const epoch = ++diagEpoch;
+  const reqId = selectedId;
+  const reqSig = currentInputSignature(body);
 
   let res, data;
   try {
-    res = await fetch(`/api/trials/${selectedId}/diagnose`, {
+    res = await fetch(`/api/trials/${reqId}/diagnose`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
     data = await res.json();
   } catch (e) {
+    if (epoch !== diagEpoch || selectedId !== reqId ||
+        currentInputSignature() !== reqSig) return;
     showError("网络/服务错误：" + e.message);
     return;
   }
+  // 按发起时记录、实际提交的测点/容差及请求先后裁决：非最新或输入已变即丢弃
+  if (epoch !== diagEpoch || selectedId !== reqId ||
+      currentInputSignature() !== reqSig) return;
   if (res.status === 404) { showError("试算记录不存在"); return; }
   if (!res.ok) { showError(data.detail || "诊断失败"); return; }
+  if (Number(data.id) !== reqId) return;
   renderDiagnosis(data.diagnosis);
 }
 
@@ -244,10 +289,21 @@ function renderDiagnosis(d) {
 /* ---------------- 事件与初始化 ---------------- */
 
 $("#recordSelect").addEventListener("change", (e) => fetchRecordMeta(e.target.value));
-$("#addPointBtn").addEventListener("click", () => { numPoints++; renderPointRows(); });
+$("#addPointBtn").addEventListener("click", () => {
+  numPoints++; renderPointRows();
+  // 批量框非空时表格不是当前提交源，其变化不作废诊断
+  if (!$("#bulkPoints").value.trim()) invalidateDiagnosis();
+});
 $("#removePointBtn").addEventListener("click", () => {
   if (numPoints <= MIN_POINTS) return;
   numPoints--; renderPointRows();
+  if (!$("#bulkPoints").value.trim()) invalidateDiagnosis();
+});
+// 当前提交源的容差/测点一经修改，旧结论与旧错误立即作废
+$("#tolerance").addEventListener("input", invalidateDiagnosis);
+$("#bulkPoints").addEventListener("input", invalidateDiagnosis);
+tbPoints.addEventListener("input", () => {
+  if (!$("#bulkPoints").value.trim()) invalidateDiagnosis();
 });
 $("#diagnoseBtn").addEventListener("click", submitDiagnosis);
 $("#bulkLoadBtn").addEventListener("click", importBulkPoints);
